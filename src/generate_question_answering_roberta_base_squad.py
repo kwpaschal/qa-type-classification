@@ -27,11 +27,19 @@ from transformers import get_linear_schedule_with_warmup
 from torch.optim import AdamW
 from torch.utils.data import Dataset, DataLoader
 from torch.amp import autocast, GradScaler
+from tokenizers import Tokenizer, AddedToken
+from tokenizers.models import BPE
+from tokenizers.pre_tokenizers import ByteLevel
+from tokenizers.processors import RobertaProcessing
+from tokenizers.decoders import ByteLevel as ByteLevelDecoder
 from collections import Counter
 import collections
 import string
 import re
 import os
+import sys
+import glob
+import random
 import numpy as np
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -41,25 +49,86 @@ from torch.utils.data.distributed import DistributedSampler
 # DDP / Device setup
 # ===========================================================================
 
+def _running_under_wsl():
+    try:
+        with open('/proc/version', encoding='utf-8') as f:
+            return 'microsoft' in f.read().lower()
+    except OSError:
+        return False
+
+
+def _distributed_backend():
+    """
+    NCCL is fastest on Linux servers but often fails on WSL2 / some Windows
+    dual-GPU setups (CUDA 999 during DDP's first collective). Default to gloo
+    there unless DDP_BACKEND is set explicitly.
+    """
+    if os.environ.get('DDP_BACKEND'):
+        return os.environ['DDP_BACKEND']
+    if sys.platform == 'win32':
+        return 'gloo'
+    if _running_under_wsl():
+        return 'gloo'
+    return 'nccl'
+
+
+# Optional: helps NCCL on consumer GPUs / odd topologies (use if you still want NCCL).
+if os.environ.get('NCCL_SAFE', '').lower() in ('1', 'true', 'yes'):
+    os.environ.setdefault('NCCL_P2P_DISABLE', '1')
+    os.environ.setdefault('NCCL_IB_DISABLE', '1')
+
 local_rank = int(os.environ.get('LOCAL_RANK', 0))
 if torch.cuda.is_available() and 'LOCAL_RANK' in os.environ:
     torch.cuda.set_device(local_rank)
-    dist.init_process_group(backend='gloo')
+    requested_backend = _distributed_backend()
+    try:
+        dist.init_process_group(backend=requested_backend)
+    except Exception as e:
+        if requested_backend == 'nccl':
+            print(f'NCCL init failed ({e}). Falling back to gloo backend.')
+            dist.init_process_group(backend='gloo')
+        else:
+            raise
+    if dist.get_rank() == 0:
+        print(f'Distributed backend: {dist.get_backend()}')
 device = torch.device(f'cuda:{local_rank}' if torch.cuda.is_available() else 'cpu')
 is_main = (not dist.is_initialized()) or dist.get_rank() == 0
+
+# Reproducibility across runs and workers.
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
+# Prefer speed over full determinism for faster multi-GPU training.
+torch.backends.cudnn.deterministic = False
+torch.backends.cudnn.benchmark = True
+if torch.cuda.is_available():
+    torch.backends.cudnn.allow_tf32 = True
 
 # ===========================================================================
 # Hyperparameters
 # ===========================================================================
 
-MAX_LENGTH     = 384
-DOC_STRIDE     = 128
-BATCH_SIZE     = 16
-EPOCHS         = 4     # lower LR needs more steps to converge
-LR             = 2e-5  # RoBERTa paper: 2e-5 for base on SQuAD (not 3e-5 like BERT)
-WARMUP_RATIO   = 0.2   # 20% warmup — RoBERTa's large vocab needs longer warmup
+MAX_LENGTH     = int(os.environ.get('MAX_LENGTH', 384))
+DOC_STRIDE     = int(os.environ.get('DOC_STRIDE', 128))
+BATCH_SIZE     = int(os.environ.get('BATCH_SIZE', 16))
+EPOCHS         = int(os.environ.get('EPOCHS', 4))
+LR             = float(os.environ.get('LR', 2.0e-5))
+WARMUP_RATIO   = float(os.environ.get('WARMUP_RATIO', 0.1))
+GRAD_ACCUM_STEPS = int(os.environ.get('GRAD_ACCUM_STEPS', 1))
+NUM_WORKERS    = int(os.environ.get('NUM_WORKERS', min(16, os.cpu_count() or 8)))
+PREFETCH_FACTOR = int(os.environ.get('PREFETCH_FACTOR', 4))
 N_BEST         = 20
 MAX_ANS_LENGTH = 30
+
+if is_main:
+    print('Training config:')
+    print(f'  MAX_LENGTH={MAX_LENGTH} DOC_STRIDE={DOC_STRIDE}')
+    print(f'  BATCH_SIZE={BATCH_SIZE} GRAD_ACCUM_STEPS={GRAD_ACCUM_STEPS}')
+    print(f'  NUM_WORKERS={NUM_WORKERS} PREFETCH_FACTOR={PREFETCH_FACTOR}')
+    print(f'  EPOCHS={EPOCHS} LR={LR} WARMUP_RATIO={WARMUP_RATIO}')
 
 # ===========================================================================
 # Official SQuAD normalisation and scoring
@@ -111,7 +180,56 @@ def squad_scores(predictions, references):
 # Tokenizer
 # ===========================================================================
 
-tokenizer = RobertaTokenizerFast.from_pretrained('roberta-base')
+def _build_roberta_tokenizer_from_files(model_name: str) -> RobertaTokenizerFast:
+    """
+    Build RobertaTokenizerFast directly from vocab.json + merges.txt.
+
+    tokenizers>=0.19 introduced a breaking format change: it no longer
+    recognises the old tokenizer.json layout where 'model.type' is absent
+    (None). When loaded that way the BPE merges are silently skipped and
+    every character becomes its own token, which destroys model performance.
+
+    Building from the raw BPE files bypasses that load path entirely and
+    restores correct subword tokenization.
+    """
+    hf_cache  = os.path.expanduser('~/.cache/huggingface/hub')
+    model_dir = 'models--' + model_name.replace('/', '--')
+    snap_dirs = sorted(glob.glob(os.path.join(hf_cache, model_dir, 'snapshots', '*')))
+    if not snap_dirs:
+        raise FileNotFoundError(
+            f'No HF cache snapshot found for {model_name}. '
+            'Download the model files first.'
+        )
+    snap        = snap_dirs[-1]
+    vocab_path  = os.path.join(snap, 'vocab.json')
+    merges_path = os.path.join(snap, 'merges.txt')
+
+    bpe = BPE.from_file(vocab=vocab_path, merges=merges_path, unk_token='<unk>')
+    backend = Tokenizer(bpe)
+    backend.pre_tokenizer = ByteLevel(add_prefix_space=False, trim_offsets=True)
+    backend.decoder       = ByteLevelDecoder(trim_offsets=True)
+    backend.post_processor = RobertaProcessing(
+        sep=('</s>', 2),
+        cls=('<s>', 0),
+        trim_offsets=True,
+        add_prefix_space=False,
+    )
+    backend.add_special_tokens([
+        AddedToken('<s>',    special=True),
+        AddedToken('<pad>',  special=True),
+        AddedToken('</s>',   special=True),
+        AddedToken('<unk>',  special=True),
+        AddedToken('<mask>', special=True, lstrip=True),
+    ])
+    return RobertaTokenizerFast(
+        tokenizer_object=backend,
+        bos_token='<s>', eos_token='</s>', sep_token='</s>',
+        cls_token='<s>', unk_token='<unk>', pad_token='<pad>',
+        mask_token='<mask>',
+    )
+
+
+tokenizer = _build_roberta_tokenizer_from_files('roberta-base')
 
 # ===========================================================================
 # Dataset loading
@@ -236,9 +354,19 @@ train_sampler = DistributedSampler(train_dataset) if dist.is_initialized() else 
 train_loader  = DataLoader(
     train_dataset, batch_size=BATCH_SIZE,
     shuffle=(train_sampler is None), sampler=train_sampler,
-    num_workers=4, pin_memory=True,
+    num_workers=NUM_WORKERS,
+    pin_memory=True,
+    persistent_workers=(NUM_WORKERS > 0),
+    prefetch_factor=PREFETCH_FACTOR if NUM_WORKERS > 0 else None,
 )
-val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, num_workers=4, pin_memory=True)
+val_loader = DataLoader(
+    val_dataset,
+    batch_size=BATCH_SIZE,
+    num_workers=NUM_WORKERS,
+    pin_memory=True,
+    persistent_workers=(NUM_WORKERS > 0),
+    prefetch_factor=PREFETCH_FACTOR if NUM_WORKERS > 0 else None,
+)
 
 # ===========================================================================
 # Model
@@ -246,13 +374,21 @@ val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, num_workers=4, pin_m
 
 model     = RobertaForQuestionAnswering.from_pretrained('roberta-base').to(device)
 if dist.is_initialized():
-    model = DDP(model, device_ids=[local_rank])
+    try:
+        model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
+    except Exception:
+        if dist.get_rank() == 0:
+            print(
+                'DDP failed (often NCCL on WSL/Windows/dual-GPU). Retry with e.g.:\n'
+                '  DDP_BACKEND=gloo torchrun --standalone --nproc_per_node=2 ...\n'
+                '  or NCCL_SAFE=1 DDP_BACKEND=nccl ...'
+            )
+        raise
 scaler    = GradScaler('cuda')
 
-# AdamW eps=1e-6 is recommended by the RoBERTa paper for fine-tuning stability;
-# the default 1e-8 can cause training instability with RoBERTa's BPE vocab.
-optimizer   = AdamW(model.parameters(), lr=LR, weight_decay=0.01, eps=1e-6)
-total_steps = len(train_loader) * EPOCHS
+optimizer = AdamW(model.parameters(), lr=LR, weight_decay=0.01)
+steps_per_epoch = (len(train_loader) + GRAD_ACCUM_STEPS - 1) // GRAD_ACCUM_STEPS
+total_steps = steps_per_epoch * EPOCHS
 
 scheduler = get_linear_schedule_with_warmup(
     optimizer,
@@ -308,6 +444,7 @@ for epoch in range(EPOCHS):
         train_sampler.set_epoch(epoch)
     model.train()
     total_loss = 0
+    optimizer.zero_grad(set_to_none=True)
 
     for batch_idx, batch in enumerate(train_loader):
         input_ids       = batch['input_ids'].to(device)
@@ -315,24 +452,26 @@ for epoch in range(EPOCHS):
         start_positions = batch['start_positions'].to(device)
         end_positions   = batch['end_positions'].to(device)
 
-        optimizer.zero_grad()
         with autocast('cuda'):
             outputs = model(
                 input_ids=input_ids, attention_mask=attention_mask,
                 start_positions=start_positions, end_positions=end_positions,
             )
-            loss = outputs.loss
+            loss = outputs.loss / GRAD_ACCUM_STEPS
 
         scaler.scale(loss).backward()
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        old_scale = scaler.get_scale()
-        scaler.step(optimizer)
-        scaler.update()
-        if scaler.get_scale() == old_scale:  # only step if no inf/NaN skip
-            scheduler.step()
+        should_step = ((batch_idx + 1) % GRAD_ACCUM_STEPS == 0) or ((batch_idx + 1) == len(train_loader))
+        if should_step:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            old_scale = scaler.get_scale()
+            scaler.step(optimizer)
+            scaler.update()
+            if scaler.get_scale() == old_scale:
+                scheduler.step()
+            optimizer.zero_grad(set_to_none=True)
 
-        total_loss += loss.item()
+        total_loss += loss.item() * GRAD_ACCUM_STEPS
         if (batch_idx + 1) % 200 == 0:
             print(f'  Epoch {epoch+1}/{EPOCHS} | Batch {batch_idx+1}/{len(train_loader)} | Loss: {loss.item():.4f}')
 
@@ -350,8 +489,8 @@ for epoch in range(EPOCHS):
                         input_ids=batch['input_ids'].to(device),
                         attention_mask=batch['attention_mask'].to(device),
                     )
-                all_start_logits.append(outputs.start_logits.cpu().numpy())
-                all_end_logits.append(outputs.end_logits.cpu().numpy())
+                all_start_logits.append(outputs.start_logits.float().cpu().numpy())
+                all_end_logits.append(outputs.end_logits.float().cpu().numpy())
 
         all_start_logits = np.concatenate(all_start_logits, axis=0)
         all_end_logits   = np.concatenate(all_end_logits,   axis=0)
